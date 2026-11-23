@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Request pageout of a touched 2 GiB anonymous mapping (Linux only)."""
+
+import mmap
+import signal
+import sys
+
+SIZE = 10 * 1024**3
+PAGE_SIZE = mmap.PAGESIZE
+MADV_PAGEOUT_UAPI = 21
+
+
+def main():
+    mapping = None
+    try:
+        if (not sys.platform.startswith("linux") or not hasattr(mmap.mmap, "madvise")
+                or not hasattr(mmap, "MAP_ANONYMOUS")):
+            raise RuntimeError("Linux anonymous mmap.madvise API is required for MADV_PAGEOUT")
+        mapping = mmap.mmap(-1, SIZE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                            prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        for offset in range(0, SIZE, PAGE_SIZE):
+            mapping[offset] = 1
+        mapping.madvise(getattr(mmap, "MADV_PAGEOUT", MADV_PAGEOUT_UAPI))
+        print("MADV_PAGEOUT requested; holding 2 GiB mapping. Press Ctrl-C to exit.",
+              file=sys.stderr, flush=True)
+        while True:
+            signal.pause()
+    except KeyboardInterrupt:
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Cannot allocate or page out 2 GiB mapping: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if mapping is not None:
+            mapping.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

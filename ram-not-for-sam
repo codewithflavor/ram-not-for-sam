@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Hold spare Linux RAM; discard only filler mappings observed in swap."""
+
+import argparse
+import ctypes
+import mmap
+import re
+import signal
+import sys
+import time
+from dataclasses import dataclass
+
+CHUNK_SIZE = 512 * 1024**2
+PAGE_SIZE = mmap.PAGESIZE
+DEFAULT_RESERVE = 256 * 1024**2
+SAMPLE_SECONDS = 1
+COOLDOWN_SECONDS = 10
+SIZE_RE = re.compile(r"([0-9]+)([kKmMgGtT]?)\Z")
+HEADER_RE = re.compile(
+    r"^([0-9a-fA-F]+)-([0-9a-fA-F]+) [r-][w-][x-][ps] "
+    r"[0-9a-fA-F]+ [0-9a-fA-F]+:[0-9a-fA-F]+ \d+(?:\s.*)?$")
+MULTIPLIERS = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+
+
+def parse_size(value):
+    match = SIZE_RE.fullmatch(value)
+    if not match:
+        raise argparse.ArgumentTypeError(f"invalid size: {value}")
+    return int(match[1]) * MULTIPLIERS[match[2].lower()]
+
+
+def parse_meminfo(contents):
+    values = {}
+    for line in contents.splitlines():
+        key = line.split(":", 1)[0]
+        if key not in ("MemTotal", "MemAvailable"):
+            continue
+        match = re.fullmatch(r"\w+:\s+([0-9]+) kB\s*", line)
+        if not match or key in values:
+            raise ValueError(f"malformed/duplicate {key} in /proc/meminfo")
+        values[key] = int(match[1]) * 1024
+    if set(values) != {"MemTotal", "MemAvailable"}:
+        raise ValueError("missing MemTotal/MemAvailable in /proc/meminfo")
+    if not 0 <= values["MemAvailable"] <= values["MemTotal"] or not values["MemTotal"]:
+        raise ValueError("invalid memory values in /proc/meminfo")
+    return values["MemTotal"], values["MemAvailable"]
+
+
+def next_chunk(available, held, amount, reserve, page_size=PAGE_SIZE):
+    """Only whole interior pages, bounded by measured headroom and current cap."""
+    remaining = min(CHUNK_SIZE, max(0, available - reserve))
+    if amount is not None:
+        remaining = min(remaining, max(0, amount - held))
+    return remaining // page_size * page_size
+
+
+@dataclass(eq=False)
+class Chunk:
+    mapping: object
+    length: int
+    address: object = None  # Interior address, not the surrounding guard pages.
+
+
+def parse_smaps(contents, chunks):
+    """Return (Rss, Swap) bytes per chunk, requiring exact interior attribution.
+
+    Guard VMAs and unrelated mappings never contribute. Split interior VMAs are
+    fine; a VMA extending beyond an interior is not attributable and is fatal.
+    """
+    records = []
+    current = None
+    previous_end = 0
+    for line in contents.splitlines():
+        header = HEADER_RE.fullmatch(line)
+        if header:
+            start, end = int(header[1], 16), int(header[2], 16)
+            if start >= end or start < previous_end:
+                raise ValueError("overlapping/unordered smaps VMAs")
+            previous_end = end
+            current = (start, end, {})
+            records.append(current)
+        else:
+            field = re.fullmatch(r"([A-Za-z_][A-Za-z_0-9]*):\s*(.*)", line)
+            if current is None or not field:
+                raise ValueError("malformed smaps header/field")
+            if field[1] in ("Rss", "Swap"):
+                key = field[1]
+                fields = current[2]
+                # Preserve malformed/duplicate fields as invalid, even outside our VMAs.
+                match = re.fullmatch(r"(?:Rss|Swap):\s+([0-9]+) kB\s*", line)
+                fields[key] = (int(match[1]) * 1024
+                               if match and key not in fields else None)
+    if not records:
+        raise ValueError("empty /proc/self/smaps")
+    if any(chunk.address is None for chunk in chunks):
+        raise ValueError("uninitialized tracked interior")
+    ordered = sorted(chunks, key=lambda chunk: chunk.address)
+    last_end = 0
+    for chunk in ordered:
+        if chunk.address is None or chunk.address < last_end or chunk.length <= 0:
+            raise ValueError("invalid/overlapping tracked interiors")
+        last_end = chunk.address + chunk.length
+    result = {}
+    index = 0
+    for chunk in ordered:
+        start, end = chunk.address, chunk.address + chunk.length
+        cursor, rss, swap = start, 0, 0
+        while index < len(records) and records[index][1] <= start:
+            index += 1
+        while index < len(records) and records[index][0] < end:
+            left, right, fields = records[index]
+            if left != cursor or right > end:
+                raise ValueError("ambiguous/spanning or incomplete smaps interior coverage")
+            if any(fields.get(key) is None for key in ("Rss", "Swap")):
+                raise ValueError("missing/malformed/duplicate Rss or Swap in filler VMA")
+            if fields["Rss"] > right - left or fields["Swap"] > right - left:
+                raise ValueError("impossible smaps accounting")
+            rss += fields["Rss"]
+            swap += fields["Swap"]
+            cursor = right
+            index += 1
+        if cursor != end:
+            raise ValueError("incomplete smaps interior coverage")
+        result[chunk] = (rss, swap)
+    return result
+
+
+def read_telemetry(chunks):
+    with open("/proc/meminfo", encoding="ascii") as source:
+        _, available = parse_meminfo(source.read())
+    with open("/proc/self/smaps", encoding="utf-8", errors="surrogateescape") as source:
+        stats = parse_smaps(source.read(), chunks)
+    return available, stats
+
+
+def load_mprotect():
+    if not sys.platform.startswith("linux") or not hasattr(mmap, "MAP_ANONYMOUS"):
+        raise RuntimeError("Linux anonymous mmap and readable /proc telemetry are required")
+    libc = ctypes.CDLL(None, use_errno=True)
+    protect = libc.mprotect
+    protect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    protect.restype = ctypes.c_int
+    return protect
+
+
+def mapping_address(mapping):
+    export = ctypes.c_char.from_buffer(mapping)
+    try:
+        return ctypes.addressof(export)
+    finally:
+        # mmap.close must never encounter an outstanding ctypes buffer export.
+        del export
+
+
+class Holder:
+    def __init__(self, reserve, amount, protect, stopped=lambda: False):
+        self.reserve = reserve
+        self.amount = amount
+        self.protect = protect
+        self.stopped = stopped
+        self.chunks = []
+        self.cooldown_until = 0
+        self.operation = None
+
+    @property
+    def held(self):
+        # Includes a partially touched chunk until its close actually succeeds.
+        return sum(chunk.length for chunk in self.chunks)
+
+    def allocate(self, length):
+        mapping = mmap.mmap(-1, length + 2 * PAGE_SIZE,
+                            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                            prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        chunk = Chunk(mapping, length)
+        self.chunks.append(chunk)  # Own it before address/protection/touch can fail.
+        base = mapping_address(mapping)
+        chunk.address = base + PAGE_SIZE
+        for address in (base, chunk.address + length):
+            if self.protect(address, PAGE_SIZE, 0) != 0:  # Linux PROT_NONE
+                error = ctypes.get_errno()
+                raise OSError(error, f"mprotect guard failed at {address:#x}")
+        for offset in range(PAGE_SIZE, PAGE_SIZE + length, PAGE_SIZE):
+            if self.stopped():
+                raise KeyboardInterrupt
+            mapping[offset] = 1
+        return chunk
+
+    def close(self, chunk):
+        chunk.mapping.close()
+        self.chunks.remove(chunk)  # Never claim bytes freed if close failed.
+
+    def step(self):
+        available, stats = read_telemetry(self.chunks)
+        if self.stopped():
+            raise KeyboardInterrupt
+        swapped = [chunk for chunk, (_, swap) in stats.items() if swap > 0]
+        if swapped:
+            for chunk in swapped:
+                self.close(chunk)  # No reads, copying, touching or swap-in.
+            self.cooldown_until = time.monotonic() + COOLDOWN_SECONDS
+            return "cleanup", available, stats
+        if time.monotonic() < self.cooldown_until:
+            return "cooldown", available, stats
+        size = next_chunk(available, self.held, self.amount, self.reserve)
+        if size:
+            self.allocate(size)
+            return "grow", available, stats
+        return "hold", available, stats
+
+    def log(self, operation, available, stats, verbose):
+        if verbose:
+            # Residency/swap are the pre-action sample, not invented post-touch data.
+            print(f"{operation}: held={self.held} resident_sample={sum(v[0] for v in stats.values())} "
+                  f"swap_sample={sum(v[1] for v in stats.values())} available={available} "
+                  f"reserve={self.reserve} "
+                  f"cooldown={max(0, self.cooldown_until - time.monotonic()):.1f}s",
+                  file=sys.stderr)
+        elif operation != self.operation:
+            print({
+                "grow": "Occupying spare RAM. Sam can cope.",
+                "hold": "Holding the RAM. Sam can wait.",
+                "cleanup": "Discarding swapped filler. Sam gets no souvenir.",
+                "cooldown": "Letting the dust settle. Not a RAM donation to Sam.",
+            }[operation], file=sys.stderr)
+        self.operation = operation
+
+    def cleanup(self):
+        failed = False
+        for chunk in list(self.chunks):
+            try:
+                self.close(chunk)
+            except (Exception, KeyboardInterrupt) as exc:
+                failed = True
+                print(f"Cannot close filler mapping ({chunk.length} bytes): {exc}",
+                      file=sys.stderr)
+        return not failed
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--amount", type=parse_size,
+                        help="current HELD byte cap (bytes or K/M/G/T; default unlimited)")
+    parser.add_argument("--reserve", type=parse_size, default=DEFAULT_RESERVE,
+                        help="emergency MemAvailable reserve (default 256M)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="detailed per-sample status")
+    args = parser.parse_args(argv)
+    holder = None
+    previous_handlers = {}
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    result = 0
+    try:
+        protect = load_mprotect()
+        holder = Holder(args.reserve, args.amount, protect, lambda: stopping)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[sig] = signal.signal(sig, stop)
+        while not stopping:
+            operation, available, stats = holder.step()
+            holder.log(operation, available, stats, args.verbose)
+            if not stopping:
+                time.sleep(SAMPLE_SECONDS)
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError, RuntimeError, AttributeError, MemoryError, BufferError) as exc:
+        print(f"RAM holder failed: {exc}", file=sys.stderr)
+        result = 1
+    finally:
+        # A second termination signal must not interrupt close/bookkeeping.
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            if holder is not None:
+                if not holder.cleanup():
+                    result = 1
+                print(f"Cleanup finished; still held={holder.held} bytes. Sam, move along.",
+                      file=sys.stderr)
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

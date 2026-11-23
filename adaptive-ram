@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Best-effort host-memory feedback allocator; not OOM protection."""
+
+import argparse
+from dataclasses import dataclass
+import math
+import mmap
+import re
+import signal
+import sys
+import time
+
+CHUNK_SIZE = 512 * 1024 * 1024
+QUIET_SECONDS = 5
+RECOVERY_PP = 3
+SETTLE_SECONDS = 5
+SAMPLE_SECONDS = 0.5
+MAX_ALLOCATION_SECONDS = 8
+RATE_RECOVERY_SECONDS = 30
+REFRESH_REARM_SECONDS = 60
+OWN_SWAP_POLL_SECONDS = 5
+# Relative to chunk size: a burst of 1/8 chunk, or >=1/512 chunk/s
+# continuously for 5s, warrants release. Every smaller delta still pauses growth.
+SWAP_SUSTAIN_SECONDS = 5
+
+
+def parse_size(value):
+    match = re.fullmatch(r"([0-9]+)([kKmMgGtT]?)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("size must be bytes or an integer with K/M/G/T")
+    return int(match[1]) * 1024 ** ("kmgt".index(match[2].lower()) + 1 if match[2] else 0)
+
+
+def parse_percent(value):
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("percentage must be numeric") from exc
+    if not math.isfinite(result) or not 0 <= result <= 100:
+        raise argparse.ArgumentTypeError("percentage must be finite and between 0 and 100")
+    return result
+
+
+def nonnegative(value):
+    if not re.fullmatch(r"[0-9]+", value):
+        raise ValueError("invalid nonnegative counter")
+    return int(value)
+
+
+def parse_meminfo(text):
+    values = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] in ("MemTotal:", "MemAvailable:"):
+            if len(fields) != 3 or fields[2] != "kB" or fields[0] in values:
+                raise ValueError("invalid meminfo field")
+            values[fields[0]] = nonnegative(fields[1]) * 1024
+    total, available = values["MemTotal:"], values["MemAvailable:"]
+    if total <= 0 or available > total:
+        raise ValueError("invalid memory totals")
+    return total, available
+
+
+def parse_psi(text):
+    values = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] in ("some", "full"):
+            totals = [field[6:] for field in fields[1:] if field.startswith("total=")]
+            if len(totals) != 1 or fields[0] in values:
+                raise ValueError("invalid PSI total")
+            values[fields[0]] = nonnegative(totals[0])
+    return values["some"], values["full"]
+
+
+def parse_vmstat(text):
+    values = [line.split() for line in text.splitlines() if line.split()[:1] == ["pswpout"]]
+    if len(values) != 1 or len(values[0]) != 2:
+        raise ValueError("missing or duplicate pswpout")
+    return nonnegative(values[0][1])
+
+
+def parse_own_swap(text):
+    fields = [line.split() for line in text.splitlines()
+              if line.split()[:1] == ["VmSwap:"]]
+    if len(fields) != 1 or len(fields[0]) != 3 or fields[0][2] != "kB":
+        raise ValueError("missing or invalid VmSwap")
+    return nonnegative(fields[0][1]) * 1024
+
+
+def read_own_swap():
+    with open("/proc/self/status", encoding="ascii") as stream:
+        return parse_own_swap(stream.read())
+
+
+@dataclass(frozen=True)
+class Sample:
+    at: float
+    total: int
+    available: int
+    some: int
+    full: int
+    swapout: int
+
+    @property
+    def used(self):
+        return self.total - self.available
+
+
+def read_sample():
+    with open("/proc/meminfo", encoding="ascii") as stream:
+        total, available = parse_meminfo(stream.read())
+    with open("/proc/pressure/memory", encoding="ascii") as stream:
+        some, full = parse_psi(stream.read())
+    with open("/proc/vmstat", encoding="ascii") as stream:
+        swapout = parse_vmstat(stream.read())
+    return Sample(time.monotonic(), total, available, some, full, swapout)
+
+
+class Holdings:
+    def __init__(self):
+        self.mappings = []
+        self.held = 0
+        self.cumulative = 0
+        self.refresh_eligible = set()
+
+    def allocate(self, size):
+        mapping = mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                            prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        # Register before touching: even partial page-touch failure must close it.
+        self.mappings.append((mapping, size))
+        self.held += size
+        self.cumulative += size
+        for offset in range(0, size, mmap.PAGESIZE):
+            mapping[offset] = 1
+
+    def release(self, size):
+        released = 0
+        while self.mappings and released < size:
+            mapping, length = self.mappings[0]
+            mapping.close()
+            self.mappings.pop(0)
+            self.refresh_eligible.discard(id(mapping))
+            self.held -= length
+            released += length
+        return released
+
+    def mark_refresh(self):
+        # Snapshot once per pass, before ordinary oldest-first release.
+        self.refresh_eligible = {id(mapping) for mapping, _ in self.mappings}
+
+    def retire_refresh(self):
+        # Oldest eligible first; never fault old contents back in by reading them.
+        for index, (mapping, length) in enumerate(self.mappings):
+            if id(mapping) in self.refresh_eligible:
+                mapping.close()
+                self.mappings.pop(index)
+                self.refresh_eligible.remove(id(mapping))
+                self.held -= length
+                return length
+        return 0
+
+    def close(self):
+        # Continue cleanup even if an individual mapping cannot be closed.
+        failures = []
+        for mapping, length in self.mappings[:]:
+            try:
+                mapping.close()
+            except (Exception, KeyboardInterrupt) as exc:
+                failures.append(str(exc))
+            else:
+                self.mappings.remove((mapping, length))
+                self.refresh_eligible.discard(id(mapping))
+                self.held -= length
+        if failures:
+            raise RuntimeError("mapping cleanup failed: " + "; ".join(failures))
+
+
+class Controller:
+    def __init__(self, ceiling, amount=None, psi_some=5, psi_full=1):
+        self.ceiling = ceiling
+        self.amount = amount
+        self.psi_some = psi_some
+        self.psi_full = psi_full
+        self.previous = None
+        self.quiet_since = None
+        self.last_release = -math.inf
+        self.release_credits = []
+        self.reason = "awaiting telemetry"
+        self.in_pressure = False
+        self.refresh_refill = False
+        self.refresh_pending = 0
+        self.refresh_evidence = True
+        self.swap_busy_seconds = 0
+        self.refresh_active = False
+        self.refresh_armed = True
+        self.refresh_ready_at = -math.inf
+        self.own_swap = None
+        self.last_known_own_swap = None
+        self.last_own_swap_check = -math.inf
+        self.retire_quiet_since = None
+        self.refresh_generation = 0
+        self.refresh_status = "idle"
+        self.allocation_interval = SAMPLE_SECONDS
+        self.last_allocation = -math.inf
+        self.last_backoff = -math.inf
+        self.rate_quiet_since = None
+
+    def finish_refresh(self, holdings, status):
+        holdings.refresh_eligible.clear()
+        self.refresh_active = self.refresh_refill = False
+        self.refresh_pending = 0
+        self.refresh_evidence = False
+        self.refresh_armed = False
+        self.refresh_ready_at = self.previous.at + REFRESH_REARM_SECONDS
+        self.refresh_status = status
+
+    def check_own_swap(self):
+        self.last_own_swap_check = self.previous.at
+        try:
+            old_swap = self.last_known_own_swap
+            self.own_swap = read_own_swap()
+            self.last_known_own_swap = self.own_swap
+            if not self.refresh_active and old_swap is not None and self.own_swap > old_swap:
+                self.refresh_evidence = True
+            if self.refresh_active and self.own_swap:
+                self.refresh_status = "finite pass active"
+            elif self.refresh_status.startswith("paused: own VmSwap unavailable"):
+                self.refresh_status = "idle"
+        except (OSError, ValueError, UnicodeError) as exc:
+            self.own_swap = None
+            self.refresh_status = f"paused: own VmSwap unavailable ({exc})"
+        return self.own_swap
+
+    @property
+    def refresh_cooldown_remaining(self):
+        return max(0, self.refresh_ready_at - self.previous.at) if self.previous else 0
+
+    @property
+    def retirement_cooldown_remaining(self):
+        if self.retire_quiet_since is None:
+            return QUIET_SECONDS
+        return max(0, QUIET_SECONDS - (self.previous.at - self.retire_quiet_since))
+
+    def discover_refresh(self, holdings):
+        # Cooldown alone cannot rearm unchanged residual Python-heap swap.
+        interval = SAMPLE_SECONDS if self.refresh_active else OWN_SWAP_POLL_SECONDS
+        if ((holdings.held or self.refresh_active)
+                and self.previous.at - self.last_own_swap_check >= interval):
+            self.check_own_swap()
+        self.refresh_armed = (self.refresh_evidence
+                              and self.previous.at >= self.refresh_ready_at)
+        if self.refresh_active:
+            if self.own_swap == 0:
+                self.finish_refresh(holdings, "cancelled: zero own swap")
+            elif not holdings.refresh_eligible and not self.refresh_refill:
+                self.finish_refresh(holdings, "completed; generation cooldown")
+        elif holdings.held and self.refresh_armed and self.own_swap:
+            holdings.mark_refresh()
+            self.refresh_active = True
+            self.refresh_generation += 1
+            self.refresh_status = "finite pass active"
+        elif not self.refresh_active and self.own_swap == 0:
+            self.refresh_status = "skipped: zero own swap or no mappings"
+
+    @property
+    def credit(self):
+        return sum(size for _, size in self.release_credits)
+
+    @property
+    def cooldown_remaining(self):
+        if self.quiet_since is None:
+            return QUIET_SECONDS
+        return max(0, QUIET_SECONDS - (self.previous.at - self.quiet_since))
+
+    def step(self, sample, holdings):
+        previous, self.previous = self.previous, sample
+        elapsed = sample.at - previous.at if previous else 0
+        interval_valid = (previous is not None and math.isfinite(elapsed) and elapsed > 0
+                          and previous.total == sample.total)
+        valid = False
+        some_valid = full_valid = False
+        some = full = 0
+        swapped = False
+        if interval_valid:
+            # Compute percentages directly so measurements and thresholds share
+            # one scale, including inclusive fractional boundaries (e.g. 0.07%).
+            some_delta = (sample.some - previous.some) / (elapsed * 10_000)
+            full_delta = (sample.full - previous.full) / (elapsed * 10_000)
+            some_valid = 0 <= some_delta <= 100
+            full_valid = 0 <= full_delta <= 100
+            some = some_delta if some_valid else 0
+            full = full_delta if full_valid else 0
+            valid = some_valid and full_valid and sample.swapout >= previous.swapout
+            swapped = sample.swapout > previous.swapout
+        swap_bytes = (sample.swapout - previous.swapout) * mmap.PAGESIZE if swapped else 0
+        if interval_valid and swapped and swap_bytes / elapsed >= CHUNK_SIZE / 512:
+            self.swap_busy_seconds += elapsed
+        else:
+            self.swap_busy_seconds = 0
+        swap_pressure = swapped and (swap_bytes >= CHUNK_SIZE / 8
+                                    or self.swap_busy_seconds >= SWAP_SUSTAIN_SECONDS)
+        if swapped and not self.refresh_active:
+            self.refresh_evidence = True
+        if self.amount is not None:
+            self.refresh_pending = min(self.refresh_pending, max(0, self.amount - holdings.held))
+        self.refresh_refill = self.refresh_pending > 0
+        observed_drop = max(0, previous.used - sample.used) if previous else 0
+        pending = []
+        for released_at, size in self.release_credits:
+            # Reconcile oldest-first, including credits expiring this sample:
+            # their delayed stats drop must not consume newer credits as well.
+            consumed = min(size, observed_drop)
+            size -= consumed
+            observed_drop -= consumed
+            if size and sample.at - released_at < SETTLE_SECONDS:
+                pending.append((released_at, size))
+        self.release_credits = pending
+        recovery = math.floor(sample.total * max(0, self.ceiling - RECOVERY_PP) / 100)
+        over = sample.used > sample.total * self.ceiling / 100
+        # A reset in one counter must not hide a valid trigger in another.
+        some_trigger = interval_valid and some_valid and some >= self.psi_some
+        full_trigger = interval_valid and full_valid and full >= self.psi_full
+        pressure = some_trigger or full_trigger or swap_pressure
+        # Subtrigger stalls are tolerated: requiring stricter PSI here can
+        # indefinitely starve startup/refill despite no actual pressure trigger.
+        quiet = valid and not pressure and not swapped
+        stable = quiet and sample.used <= recovery
+        if not stable:
+            self.quiet_since = None
+        self.discover_refresh(holdings)
+        if not quiet or over:
+            self.retire_quiet_since = None
+        elif self.retire_quiet_since is None:
+            self.retire_quiet_since = sample.at
+        if not stable:
+            self.rate_quiet_since = None
+        else:
+            if self.rate_quiet_since is None:
+                self.rate_quiet_since = sample.at
+            if sample.at - self.rate_quiet_since >= RATE_RECOVERY_SECONDS:
+                self.allocation_interval = max(SAMPLE_SECONDS, self.allocation_interval / 2)
+                self.rate_quiet_since = sample.at
+        if over or pressure:
+            if sample.at - self.last_backoff >= SETTLE_SECONDS:
+                self.allocation_interval = min(MAX_ALLOCATION_SECONDS,
+                                               self.allocation_interval * 2)
+                self.last_backoff = sample.at
+            self.in_pressure = True
+            self.quiet_since = None
+            triggers = []
+            if over:
+                triggers.append("RAM above ceiling")
+            if interval_valid:
+                if some_trigger:
+                    triggers.append(f"PSI some={some:g}% >= {self.psi_some:g}%")
+                if full_trigger:
+                    triggers.append(f"PSI full={full:g}% >= {self.psi_full:g}%")
+                if swapped:
+                    severity = "release pressure" if swap_pressure else "minor pause"
+                    triggers.append(f"new swap-out ({severity}): pswpout +{sample.swapout - previous.swapout} pages")
+            self.reason = ", ".join(triggers)
+            # Credit recent unmaps until observed in MemAvailable (or settling expires).
+            # Never repeatedly subtract the same stale used-memory measurement.
+            release = max(0, sample.used - recovery - self.credit) if over else 0
+            if pressure and sample.at - self.last_release >= SETTLE_SECONDS:
+                release = max(release, CHUNK_SIZE, (holdings.held + 9) // 10)
+            if release and holdings.held:
+                freed = holdings.release(release)
+                self.release_credits.append((sample.at, freed))
+                self.last_release = sample.at
+                # A safety reduction deliberately lowers the holding target; do
+                # not resurrect a pre-pressure cleanup replacement obligation.
+                self.refresh_pending = 0
+                self.refresh_refill = False
+                return "release"
+            return "pressure-hold"
+        if quiet:
+            self.in_pressure = False
+        # Retirement needs no allocation headroom. Keep its own below-ceiling
+        # quiet timer so the hysteresis band cannot indefinitely retain old swap.
+        if (self.refresh_active and quiet and self.own_swap is not None
+                and sample.at - self.retire_quiet_since >= QUIET_SECONDS):
+            if not self.refresh_refill and holdings.refresh_eligible:
+                retired = holdings.retire_refresh()
+                if retired:
+                    self.refresh_refill = True
+                    self.refresh_pending = retired
+                    self.reason = f"refresh retired {retired} bytes without reading; awaiting fresh telemetry"
+                    return "refresh-retire"
+        if not quiet or sample.used > recovery:
+            self.quiet_since = None
+            self.reason = (f"minor swap-out pause: pswpout +{sample.swapout - previous.swapout} pages"
+                           if swapped else "telemetry baseline/reset or invalid interval" if not quiet
+                            else "RAM above recovery band")
+            return "swap-pause" if swapped else "recovery-hold"
+        if self.quiet_since is None:
+            self.quiet_since = sample.at
+        if sample.at - self.quiet_since < QUIET_SECONDS:
+            self.reason = f"waiting for {QUIET_SECONDS:g}s below pressure triggers in recovery band"
+            return "cooldown"
+        if self.refresh_active and self.own_swap is None:
+            self.reason = "refresh paused: own VmSwap unknown; retrying"
+            return "refresh-hold"
+        # Refresh takes priority over growth, including at the amount cap. Each
+        # retirement has exactly one outstanding byte deficit, including partial
+        # replacement. No further retirement until it is satisfied. Never credit it.
+        refreshing = self.refresh_refill
+        size = min(CHUNK_SIZE, recovery - sample.used)
+        if refreshing:
+            size = min(size, self.refresh_pending)
+        if self.amount is not None:
+            size = min(size, self.amount - holdings.held)
+        if size > 0:
+            if sample.at - self.last_allocation < self.allocation_interval:
+                self.reason = f"allocation backoff: interval={self.allocation_interval:g}s"
+                return "allocation-wait"
+            holdings.allocate(size)
+            self.last_allocation = sample.at
+            if refreshing:
+                self.refresh_pending -= size
+                self.refresh_refill = self.refresh_pending > 0
+                if not holdings.refresh_eligible and not self.refresh_refill:
+                    self.finish_refresh(holdings, "completed; generation cooldown")
+                self.reason = "refresh replacement bounded by fresh recovery headroom and amount cap"
+                return "refresh-refill"
+            self.reason = "recovery complete; headroom available"
+            return "refill"
+        if refreshing:
+            self.reason = "refresh replacement pending: no measured headroom or amount allowance"
+            return "refresh-hold"
+        self.reason = "amount cap or recovery headroom exhausted"
+        return "cap/headroom-hold"
+
+
+class StatusLogger:
+    OPERATIONS = {
+        "recovery-hold": "recovery",
+        "cooldown": "cooldown",
+        "refill": "refill",
+        "release": "pressure-release",
+        "pressure-hold": "pressure-release",
+        "swap-pause": "swap-pause",
+        "refresh-retire": "refresh",
+        "refresh-refill": "refresh",
+        "refresh-hold": "refresh",
+        "cap/headroom-hold": "holding",
+    }
+    MESSAGES = {
+        "recovery": "Waiting for safe RAM headroom. Sam can wait at the back of the queue.",
+        "cooldown": "Waiting for pressure to clear. Unlike Sam, this program respects limits.",
+        "refill": "Occupying spare RAM. Sam can cope.",
+        "pressure-release": "Backing off under RAM pressure. Sam gets no victory lap.",
+        "swap-pause": "A little swap traffic: pausing growth, not surrendering RAM to Sam.",
+        "refresh": "Cleaning up swapped old RAM mappings. Sam can keep his hands off the replacements.",
+        "holding": "RAM secured. Sam’s allocation remains zero.",
+    }
+
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self.previous_operation = None
+
+    def log(self, action, controller, holdings):
+        if self.verbose:
+            print(f"{action}: held={holdings.held} cumulative={holdings.cumulative} bytes "
+                  f"reason={controller.reason}; "
+                  f"cooldown_remaining={controller.cooldown_remaining:.1f}s; "
+                   f"allocation_interval={controller.allocation_interval:g}s; "
+                   f"refresh={controller.refresh_status}; ownswap_bytes={controller.own_swap}; "
+                   f"eligible={len(holdings.refresh_eligible)}; "
+                   f"generation={controller.refresh_generation}; "
+                   f"generation_cooldown={controller.refresh_cooldown_remaining:.1f}s; "
+                    f"refresh_active={controller.refresh_active}; "
+                    f"replacement_pending={controller.refresh_pending}; "
+                   f"retirement_cooldown={controller.retirement_cooldown_remaining:.1f}s",
+                  file=sys.stderr, flush=True)
+            return
+        if action == "allocation-wait":
+            operation = "refresh" if controller.refresh_refill else "refill"
+        else:
+            operation = self.OPERATIONS[action]
+        if operation != self.previous_operation:
+            print(self.MESSAGES[operation], file=sys.stderr, flush=True)
+            self.previous_operation = operation
+
+
+def interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ceiling", type=parse_percent, default=90,
+                        help="used RAM ceiling in percent (default: 90)")
+    parser.add_argument("--amount", type=parse_size,
+                        help="maximum bytes currently held (bytes or K/M/G/T)")
+    parser.add_argument("--psi-some", type=parse_percent, default=5,
+                        help="PSI some interval stall percentage triggering release (0..100; default: 5)")
+    parser.add_argument("--psi-full", type=parse_percent, default=1,
+                        help="PSI full interval stall percentage triggering release (0..100; default: 1)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="log detailed status for every sample instead of operation changes only")
+    args = parser.parse_args(argv)
+    logger = StatusLogger(args.verbose)
+    holdings = Holdings()
+    handlers = {}
+    status = 0
+    try:
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("Linux /proc telemetry is required")
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            handlers[sig] = signal.signal(sig, interrupted)
+        controller = Controller(args.ceiling, args.amount, args.psi_some, args.psi_full)
+        while True:
+            started = time.monotonic()
+            sample = read_sample()
+            action = controller.step(sample, holdings)
+            logger.log(action, controller, holdings)
+            time.sleep(max(0, SAMPLE_SECONDS - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError, KeyError, RuntimeError, MemoryError, OverflowError) as exc:
+        print(f"adaptive-ram failed: {exc}", file=sys.stderr)
+        status = 1
+    finally:
+        # Repeated termination requests must not interrupt cleanup.
+        for sig in handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            holdings.close()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            status = 1
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        cleanup = (f"Mapping cleanup incomplete; held={holdings.held} bytes" if holdings.held
+                   else "Released mappings")
+        print(f"{cleanup}; cumulative={holdings.cumulative} bytes", file=sys.stderr)
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
